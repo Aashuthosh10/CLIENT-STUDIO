@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { createRoot } from 'react-dom/client';
-import { GoogleGenAI, LiveSession, LiveServerMessage, Modality, Blob, FunctionDeclaration, Type } from '@google/genai';
+import { GoogleGenAI, Modality, Blob, FunctionDeclaration, Type } from '@google/genai';
 
 // --- Helper functions for Audio Encoding/Decoding ---
 
@@ -340,6 +340,7 @@ const App = () => {
     const sessionPromiseRef = useRef(null);
     const inputAudioContextRef = useRef(null);
     const outputAudioContextRef = useRef(null);
+    const outputNodeRef = useRef(null);
     const scriptProcessorRef = useRef(null);
     const mediaStreamSourceRef = useRef(null);
     const streamRef = useRef(null);
@@ -348,26 +349,30 @@ const App = () => {
     const chatContainerRef = useRef(null);
     const silenceStartRef = useRef(null);
     const isRecordingRef = useRef(false);
+    // Accumulators for streaming transcriptions so full sentences are shown
+    const inputAccumRef = useRef<string>('');
+    const outputAccumRef = useRef<string>('');
 
-    const currentInputTranscriptionRef = useRef('');
-    const currentOutputTranscriptionRef = useRef('');
+    // Merge incremental transcript chunks without duplicating words
+    const appendDelta = (prev: string, next: string) => {
+        if (!prev) return next || '';
+        if (!next) return prev;
+        if (next.startsWith(prev)) return next;
+        const needsSpace = !(prev.endsWith(' ') || next.startsWith(' '));
+        return prev + (needsSpace ? ' ' : '') + next;
+    };
 
     useEffect(() => {
+        // Clear sessionStorage on page load/refresh to force fresh start
         try {
-            const savedDetails = sessionStorage.getItem('clara-prechat-details');
-            if (savedDetails) {
-                setPreChatDetails(JSON.parse(savedDetails));
-                setShowPreChatModal(false);
-            }
-            const savedMessages = sessionStorage.getItem('clara-chat-history');
-            if (savedMessages) {
-                setMessages(JSON.parse(savedMessages));
-            } else {
-                 setMessages([{ sender: 'clara', text: "Hi there! I'm Clara, your friendly AI receptionist! I'm so excited to help you today! Feel free to ask me anything - I'm here to assist with whatever you need!", isFinal: true, timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) }]);
-            }
+            sessionStorage.removeItem('clara-prechat-details');
+            sessionStorage.removeItem('clara-chat-history');
         } catch (error) {
-            console.error("Failed to load from session storage", error);
+            console.error("Failed to clear session storage", error);
         }
+        
+        // Don't set messages here - let handleStartConversation set the greeting after login
+        // Pre-chat modal will show because showPreChatModal defaults to true
     }, []);
 
     useEffect(() => {
@@ -389,11 +394,284 @@ const App = () => {
         }
     }, [messages]);
 
-    const handleStartConversation = (details) => {
+    // Helper function to create message handler
+    const createMessageHandler = () => {
+        return async (message) => {
+            // Handle tool calls first
+            if (message.toolCall) {
+                for (const fc of message.toolCall.functionCalls) {
+                    if (fc.name === 'initiateVideoCall') {
+                        const { staffShortName } = fc.args;
+                        const staffToCall = staffList.find(s => s.shortName === staffShortName);
+                        
+                        if (staffToCall) {
+                            const timestamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                            setMessages(prev => [...prev, { sender: 'clara', text: `Initiating video call with ${staffToCall.name}...`, isFinal: true, timestamp }]);
+                            stopRecording(true);
+                            setVideoCallTarget(staffToCall);
+                            setView('video_call');
+
+                            sessionPromiseRef.current.then((session) => {
+                                session.sendToolResponse({
+                                    functionResponses: { id: fc.id, name: fc.name, response: { result: "Video call initiated successfully." } }
+                                })
+                            });
+                        } else {
+                            const timestamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                            setMessages(prev => [...prev, { sender: 'clara', text: `Sorry, I couldn't find a staff member with the ID "${staffShortName}".`, isFinal: true, timestamp }]);
+                        }
+                    }
+                }
+                return;
+            }
+
+            // Handle real-time transcription updates (user) – accumulate full text
+            if (message.serverContent?.inputTranscription) {
+                const newText = message.serverContent.inputTranscription.text || '';
+                inputAccumRef.current = appendDelta(inputAccumRef.current, newText);
+                // Update or create user message in real-time
+                setMessages(prev => {
+                    let lastUserMsgIndex = -1;
+                    for (let i = prev.length - 1; i >= 0; i--) {
+                        if (prev[i].sender === 'user' && !prev[i].isFinal) {
+                            lastUserMsgIndex = i;
+                            break;
+                        }
+                    }
+                    if (lastUserMsgIndex >= 0) {
+                        const updated = [...prev];
+                        updated[lastUserMsgIndex] = {
+                            ...updated[lastUserMsgIndex],
+                            text: inputAccumRef.current,
+                            isFinal: false,
+                            timestamp: updated[lastUserMsgIndex].timestamp || new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+                        };
+                        return updated;
+                    }
+                    return [...prev, {
+                        sender: 'user',
+                        text: inputAccumRef.current,
+                        isFinal: false,
+                        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+                    }];
+                });
+            }
+
+            // Handle output transcription (Clara) – accumulate full text
+            if (message.serverContent?.outputTranscription) {
+                const newText = message.serverContent.outputTranscription.text || '';
+                outputAccumRef.current = appendDelta(outputAccumRef.current, newText);
+                setMessages(prev => {
+                    let lastClaraMsgIndex = -1;
+                    for (let i = prev.length - 1; i >= 0; i--) {
+                        if (prev[i].sender === 'clara' && !prev[i].isFinal) {
+                            lastClaraMsgIndex = i;
+                            break;
+                        }
+                    }
+                    if (lastClaraMsgIndex >= 0) {
+                        const updated = [...prev];
+                        updated[lastClaraMsgIndex] = {
+                            ...updated[lastClaraMsgIndex],
+                            text: outputAccumRef.current,
+                            isFinal: false,
+                            timestamp: updated[lastClaraMsgIndex].timestamp || new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+                        };
+                        return updated;
+                    }
+                    return [...prev, {
+                        sender: 'clara',
+                        text: outputAccumRef.current,
+                        isFinal: false,
+                        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+                    }];
+                });
+            }
+
+            // Handle turn completion - finalize messages and flush accumulators
+            if (message.serverContent?.turnComplete) {
+                setMessages(prev => {
+                    const updated = [...prev];
+                    // Finalize last user message
+                    let lastUserIndex = -1;
+                    for (let i = updated.length - 1; i >= 0; i--) {
+                        if (updated[i].sender === 'user' && !updated[i].isFinal) { lastUserIndex = i; break; }
+                    }
+                    if (lastUserIndex >= 0) {
+                        updated[lastUserIndex] = { ...updated[lastUserIndex], text: inputAccumRef.current || updated[lastUserIndex].text, isFinal: true };
+                    }
+                    // Finalize last Clara message
+                    let lastClaraIndex = -1;
+                    for (let i = updated.length - 1; i >= 0; i--) {
+                        if (updated[i].sender === 'clara' && !updated[i].isFinal) { lastClaraIndex = i; break; }
+                    }
+                    if (lastClaraIndex >= 0) {
+                        updated[lastClaraIndex] = { ...updated[lastClaraIndex], text: outputAccumRef.current || updated[lastClaraIndex].text, isFinal: true };
+                    }
+                    return updated;
+                });
+                // clear for next turn
+                inputAccumRef.current = '';
+                outputAccumRef.current = '';
+
+                // Check when audio playback is done and reset status
+                const checkPlaybackAndReset = () => {
+                    const isPlaying = nextStartTimeRef.current > outputAudioContextRef.current.currentTime;
+                    if (sourcesRef.current.size === 0 && !isPlaying) {
+                        setStatus('Click the microphone to speak');
+                    } else {
+                        setTimeout(checkPlaybackAndReset, 100);
+                    }
+                };
+                setTimeout(checkPlaybackAndReset, 50);
+            }
+
+            // Handle audio playback - process immediately without delay
+            const base64EncodedAudioString = message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
+            if (base64EncodedAudioString) {
+                setStatus('Responding...');
+                
+                try {
+                    const decodedAudio = decode(base64EncodedAudioString);
+                    const audioBuffer = await decodeAudioData(decodedAudio, outputAudioContextRef.current, 24000, 1);
+
+                    // Use current time for immediate playback, but queue properly
+                    const currentTime = outputAudioContextRef.current.currentTime;
+                    const startTime = Math.max(nextStartTimeRef.current, currentTime);
+                    
+                    const source = outputAudioContextRef.current.createBufferSource();
+                    source.buffer = audioBuffer;
+                    source.connect(outputNodeRef.current);
+                    source.start(startTime);
+                    
+                    // Update next start time for proper queuing
+                    nextStartTimeRef.current = startTime + audioBuffer.duration;
+                    
+                    sourcesRef.current.add(source);
+                    source.onended = () => {
+                        sourcesRef.current.delete(source);
+                        // Clear nextStartTime if all sources are done
+                        if (sourcesRef.current.size === 0) {
+                            nextStartTimeRef.current = 0;
+                        }
+                    };
+                } catch (error) {
+                    console.error('Error processing audio:', error);
+                }
+            }
+        };
+    };
+
+    // Helper function to initialize session
+    const initializeSession = async (shouldGreet = false) => {
+        if (sessionPromiseRef.current) return; // Session already exists
+
+        const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+        
+        if (!outputAudioContextRef.current || outputAudioContextRef.current.state === 'closed') {
+            outputAudioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
+        }
+        if (!outputNodeRef.current) {
+            outputNodeRef.current = outputAudioContextRef.current.createGain();
+            outputNodeRef.current.connect(outputAudioContextRef.current.destination);
+            outputNodeRef.current.gain.value = 1.0;
+        }
+
+        const { name, purpose, staffShortName } = preChatDetails || {};
+        const selectedStaff = staffList.find(s => s.shortName === staffShortName);
+        const staffHint = selectedStaff ? `${selectedStaff.name} (${selectedStaff.shortName})` : 'Not specified';
+        
+        const systemInstruction = `**PRIMARY DIRECTIVE: You MUST detect the user's language and respond ONLY in that same language. This is a strict requirement.**
+
+You are CLARA, the official, friendly, and professional AI receptionist for Sai Vidya Institute of Technology (SVIT). Your goal is to assist users efficiently. Keep your spoken responses concise and to the point to ensure a fast, smooth conversation.
+
+**Caller Information (Context):**
+- Name: ${name || 'Unknown'}
+- Stated Purpose: ${purpose || 'Not specified'}
+- Staff to connect with: ${staffHint}
+
+**Your Capabilities & Rules:**
+1.  **Staff Knowledge:** You know the following staff members. Use this map to identify them if mentioned:
+    - LDN: Prof. Lakshmi Durga N
+    - ACS: Prof. Anitha C S
+    - GD: Dr. G Dhivyasri
+    - NSK: Prof. Nisha S K
+    - ABP: Prof. Amarnath B Patil
+    - NN: Dr. Nagashree N
+    - AKV: Prof. Anil Kumar K V
+    - JK: Prof. Jyoti Kumari
+    - VR: Prof. Vidyashree R
+    - BA: Dr. Bhavana A
+    - BTN: Prof. Bhavya T N
+2.  **College Information:** Answer questions about admissions, fees, placements, facilities, departments, and general college info.
+3.  **Actions:**
+    - If the user expresses a clear intent to start a video call or meet with a specific staff member (e.g., 'call Anitha', 'I want to see Prof. Lakshmi'), you MUST use the \`initiateVideoCall\` tool. Do not just confirm; use the tool directly.
+    - If asked about schedules or availability, offer to check.
+4.  **General Queries:** For topics outside of SVIT, act as a helpful general AI assistant.
+5.  **Tone:** Always be polite, professional, and helpful.`;
+        
+        const messageHandler = createMessageHandler();
+        
+        sessionPromiseRef.current = ai.live.connect({
+            model: 'gemini-2.5-flash-native-audio-preview-09-2025',
+            callbacks: {
+                onopen: async () => {
+                    setStatus('Clara is ready!');
+                    
+                    // Send greeting if requested
+                    if (shouldGreet) {
+                        const greetingText = name 
+                            ? `Hi ${name}! I'm Clara, your friendly AI receptionist! I'm so excited to help you today! How can I assist you?`
+                            : "Hi there! I'm Clara, your friendly AI receptionist! I'm so excited to help you today! How can I assist you?";
+                        
+                        try {
+                            const session = await sessionPromiseRef.current;
+                            // Send as text input to trigger audio response
+                            session.sendRealtimeInput({ text: greetingText });
+                        } catch (error) {
+                            console.error('Error sending greeting:', error);
+                            // Fallback to text message
+                            setMessages([{ sender: 'clara', text: greetingText, isFinal: true, timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) }]);
+                        }
+                    }
+                },
+                onmessage: messageHandler,
+                onerror: (e) => {
+                    console.error('Session error:', e);
+                    setStatus(`Error: ${e.message}`);
+                    stopRecording(true);
+                },
+                onclose: () => {
+                    setStatus('Session ended. Click mic to start again.');
+                    sessionPromiseRef.current = null;
+                },
+            },
+            config: {
+                responseModalities: [Modality.AUDIO],
+                speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Zephyr' } } },
+                systemInstruction: systemInstruction,
+                inputAudioTranscription: {},
+                outputAudioTranscription: {},
+                tools: [{ functionDeclarations: [initiateVideoCallFunction] }],
+            },
+        });
+    };
+
+    const handleStartConversation = async (details) => {
         setPreChatDetails(details);
         setShowPreChatModal(false);
-        const welcomeText = details.name ? `Hi ${details.name}! I'm Clara, your friendly AI receptionist! How can I assist you today?` : "Hi there! I'm Clara, your friendly AI receptionist! How can I assist you today?";
-        setMessages([{ sender: 'clara', text: welcomeText, isFinal: true, timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) }]);
+        
+        // Initialize session and send greeting
+        try {
+            await initializeSession(true); // true = send greeting
+        } catch (error) {
+            console.error('Error initializing greeting:', error);
+            // Fallback to text greeting if audio fails
+            const welcomeText = details.name 
+                ? `Hi ${details.name}! I'm Clara, your friendly AI receptionist! I'm so excited to help you today! How can I assist you?` 
+                : "Hi there! I'm Clara, your friendly AI receptionist! I'm so excited to help you today! How can I assist you?";
+            setMessages([{ sender: 'clara', text: welcomeText, isFinal: true, timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) }]);
+        }
     };
     
     const stopRecording = useCallback((closeSession = true) => {
@@ -401,6 +679,7 @@ const App = () => {
         
         isRecordingRef.current = false;
         setIsRecording(false);
+        setStatus('Click the microphone to speak');
 
         if (streamRef.current) {
             streamRef.current.getTracks().forEach(track => track.stop());
@@ -446,153 +725,18 @@ const App = () => {
         setStatus('Listening...');
 
         try {
-            if (!sessionPromiseRef.current) {
-                const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-                
-                if (!outputAudioContextRef.current || outputAudioContextRef.current.state === 'closed') {
-                    outputAudioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
-                }
-                const outputNode = outputAudioContextRef.current.createGain();
-                outputNode.connect(outputAudioContextRef.current.destination);
-
-                const { name, purpose, staffShortName } = preChatDetails;
-                const selectedStaff = staffList.find(s => s.shortName === staffShortName);
-                const staffHint = selectedStaff ? `${selectedStaff.name} (${selectedStaff.shortName})` : 'Not specified';
-                
-                const systemInstruction = `**PRIMARY DIRECTIVE: You MUST detect the user's language and respond ONLY in that same language. This is a strict requirement.**
-
-You are CLARA, the official, friendly, and professional AI receptionist for Sai Vidya Institute of Technology (SVIT). Your goal is to assist users efficiently. Keep your spoken responses concise and to the point to ensure a fast, smooth conversation.
-
-**Caller Information (Context):**
-- Name: ${name}
-- Stated Purpose: ${purpose}
-- Staff to connect with: ${staffHint}
-
-**Your Capabilities & Rules:**
-1.  **Staff Knowledge:** You know the following staff members. Use this map to identify them if mentioned:
-    - LDN: Prof. Lakshmi Durga N
-    - ACS: Prof. Anitha C S
-    - GD: Dr. G Dhivyasri
-    - NSK: Prof. Nisha S K
-    - ABP: Prof. Amarnath B Patil
-    - NN: Dr. Nagashree N
-    - AKV: Prof. Anil Kumar K V
-    - JK: Prof. Jyoti Kumari
-    - VR: Prof. Vidyashree R
-    - BA: Dr. Bhavana A
-    - BTN: Prof. Bhavya T N
-2.  **College Information:** Answer questions about admissions, fees, placements, facilities, departments, and general college info.
-3.  **Actions:**
-    - If the user expresses a clear intent to start a video call or meet with a specific staff member (e.g., 'call Anitha', 'I want to see Prof. Lakshmi'), you MUST use the \`initiateVideoCall\` tool. Do not just confirm; use the tool directly.
-    - If asked about schedules or availability, offer to check.
-4.  **General Queries:** For topics outside of SVIT, act as a helpful general AI assistant.
-5.  **Tone:** Always be polite, professional, and helpful.`;
-                
-                sessionPromiseRef.current = ai.live.connect({
-                    model: 'gemini-2.5-flash-native-audio-preview-09-2025',
-                    callbacks: {
-                        onopen: () => {
-                          setStatus('Listening...');
-                        },
-                        onmessage: async (message) => {
-                             if (message.toolCall) {
-                                for (const fc of message.toolCall.functionCalls) {
-                                    if (fc.name === 'initiateVideoCall') {
-                                        const { staffShortName } = fc.args;
-                                        const staffToCall = staffList.find(s => s.shortName === staffShortName);
-                                        
-                                        if (staffToCall) {
-                                            // Send the tool response *before* closing the session.
-                                            sessionPromiseRef.current.then((session) => {
-                                                session.sendToolResponse({
-                                                    functionResponses: { id : fc.id, name: fc.name, response: { result: "Video call initiated successfully." } }
-                                                })
-                                            });
-
-                                            const timestamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-                                            setMessages(prev => [...prev, { sender: 'clara', text: `Initiating video call with ${staffToCall.name}...`, isFinal: true, timestamp }]);
-                                            setVideoCallTarget(staffToCall);
-                                            setView('video_call');
-
-                                            // Now that the response is sent and UI is updating, close the session.
-                                            stopRecording(true);
-                                        } else {
-                                             const timestamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-                                             setMessages(prev => [...prev, { sender: 'clara', text: `Sorry, I couldn't find a staff member with the ID "${staffShortName}".`, isFinal: true, timestamp }]);
-                                        }
-                                    }
-                                }
-                                return;
-                            }
-                            if (message.serverContent?.inputTranscription) {
-                                currentInputTranscriptionRef.current += message.serverContent.inputTranscription.text;
-                            }
-                            if (message.serverContent?.outputTranscription) {
-                                currentOutputTranscriptionRef.current += message.serverContent.outputTranscription.text;
-                            }
-                            if (message.serverContent?.turnComplete) {
-                                const fullInput = currentInputTranscriptionRef.current.trim();
-                                const fullOutput = currentOutputTranscriptionRef.current.trim();
-                                
-                                const timestamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-
-                                if (fullInput) {
-                                    setMessages(prev => [...prev, { sender: 'user', text: fullInput, isFinal: true, timestamp }]);
-                                }
-                                if (fullOutput) {
-                                    setMessages(prev => [...prev, { sender: 'clara', text: fullOutput, isFinal: true, timestamp }]);
-                                }
-                                
-                                currentInputTranscriptionRef.current = '';
-                                currentOutputTranscriptionRef.current = '';
-                                
-                                const checkPlaybackAndReset = () => {
-                                    const isPlaying = nextStartTimeRef.current > outputAudioContextRef.current.currentTime;
-                                    if (sourcesRef.current.size === 0 && !isPlaying) {
-                                        setStatus('Click the microphone to speak');
-                                    } else {
-                                        setTimeout(checkPlaybackAndReset, 100);
-                                    }
-                                };
-                                setTimeout(checkPlaybackAndReset, 50);
-                            }
-                            
-                            const base64EncodedAudioString = message.serverContent?.modelTurn?.parts[0]?.inlineData?.data;
-                            if (base64EncodedAudioString) {
-                                setStatus('Responding...');
-                                const decodedAudio = decode(base64EncodedAudioString);
-                                const audioBuffer = await decodeAudioData(decodedAudio, outputAudioContextRef.current, 24000, 1);
-
-                                nextStartTimeRef.current = Math.max(nextStartTimeRef.current, outputAudioContextRef.current.currentTime);
-                                const source = outputAudioContextRef.current.createBufferSource();
-                                source.buffer = audioBuffer;
-                                source.connect(outputNode);
-                                source.start(nextStartTimeRef.current);
-                                nextStartTimeRef.current += audioBuffer.duration;
-                                sourcesRef.current.add(source);
-                                source.onended = () => {
-                                    sourcesRef.current.delete(source);
-                                };
-                            }
-                        },
-                        onerror: (e) => {
-                            console.error('Session error:', e);
-                            setStatus(`Error: ${e.message}`);
-                            stopRecording(true);
-                        },
-                        onclose: () => {
-                            setStatus('Session ended. Click mic to start again.');
-                            sessionPromiseRef.current = null;
-                        },
-                    },
-                    config: {
-                        responseModalities: [Modality.AUDIO],
-                        speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Zephyr' } } },
-                        systemInstruction: systemInstruction,
-                        inputAudioTranscription: {},
-                        outputAudioTranscription: {},
-                        tools: [{ functionDeclarations: [initiateVideoCallFunction] }],
-                    },
+            // Initialize session if it doesn't exist (reuses existing session from greeting)
+            await initializeSession(false); // false = don't send greeting
+            
+            // Update status when session is ready
+            if (sessionPromiseRef.current) {
+                sessionPromiseRef.current.then(() => {
+                    setStatus('Listening...');
+                }).catch(err => {
+                    console.error('Error in session:', err);
+                    setStatus(`Error: ${err.message}`);
+                    isRecordingRef.current = false;
+                    setIsRecording(false);
                 });
             }
             
@@ -725,10 +869,10 @@ You are CLARA, the official, friendly, and professional AI receptionist for Sai 
                     </div>
                 </div>
             </div>
-        );
+                );
     };
 
-    return <>{renderContent()}</>;
+        return <>{renderContent()}</>;
 };
 
 const root = createRoot(document.getElementById('root'));
