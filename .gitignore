@@ -22,3 +22,23 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Environment files
+.env
+.env.*
+
+# Build / cache
+.cache
+.vite
+dist
+build
+out
+
+# Coverage
+coverage
+
+# OS files
+Thumbs.db
+
+# Optional lockfiles (uncomment if you don't want to commit lockfiles)
+# package-lock.json
